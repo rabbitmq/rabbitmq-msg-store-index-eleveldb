@@ -49,9 +49,8 @@
 -define(OPEN_OPTIONS,
   [{create_if_missing, true},
    {write_buffer_size, 5242880},
-   {compression,  true},
-   {total_leveldb_mem_percent, 10},
-   {use_bloomfilter, false},
+   {compression,  false},
+   {use_bloomfilter, true},
    {paranoid_checks, false},
    {verify_compactions, false}]).
 
@@ -134,7 +133,8 @@ delete_object(Obj, #index_state{ server = Server }) ->
 -spec clean_up_temporary_reference_count_entries_without_file(index_state()) -> 'ok'.
 clean_up_temporary_reference_count_entries_without_file(#index_state{ server = Server }) ->
     {ok, RecoveryIndex, Dir} = gen_server:call(Server, clean_up_temporary_reference_count_entries_without_file),
-    spawn(fun() -> clear_recovery_index(RecoveryIndex, Dir) end),
+    Pid = self(),
+    spawn_link(fun() -> clear_recovery_index(RecoveryIndex, Dir), unlink(Pid) end),
     ok.
 
 -spec terminate(index_state()) -> any().
