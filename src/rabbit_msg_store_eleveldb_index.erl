@@ -43,7 +43,8 @@
 -record(index_state, {
     db,
     server,
-    read_options
+    read_options,
+    write_options
 }).
 
 -define(OPEN_OPTIONS,
@@ -63,13 +64,13 @@
 
 -spec new(file:filename()) -> index_state().
 new(BaseDir) ->
-    {ok, Pid} = gen_server:start_link(?MODULE, [BaseDir, ?READ_OPTIONS, new], []),
-    index_state(Pid, ?READ_OPTIONS).
+    {ok, Pid} = gen_server:start_link(?MODULE, [BaseDir, new], []),
+    index_state(Pid).
 
 -spec recover(file:filename()) -> {ok, index_state()} | {error, term()}.
 recover(BaseDir) ->
-    case gen_server:start_link(?MODULE, [BaseDir, ?READ_OPTIONS, recover], []) of
-        {ok, Pid}    -> {ok, index_state(Pid, ?READ_OPTIONS)};
+    case gen_server:start_link(?MODULE, [BaseDir, recover], []) of
+        {ok, Pid}    -> {ok, index_state(Pid)};
         {error, Err} -> {error, Err}
     end.
 
@@ -85,7 +86,7 @@ lookup(MsgId, #index_state{db = DB, read_options = ReadOptions}) ->
 
 % fail if object exists
 -spec insert(tuple(), index_state()) -> 'ok'.
-insert(Obj, #index_state{ server = Server }) ->
+insert(Obj, State) ->
     MsgId = Obj#msg_location.msg_id,
     Val = encode_val(Obj),
 %% We need the file to update recovery index.
@@ -93,7 +94,7 @@ insert(Obj, #index_state{ server = Server }) ->
 %% should be deleted at the end of a recovery
 %% File can become defined, and should not be deleted.
     File = Obj#msg_location.file,
-    gen_server:call(Server, {insert, MsgId, Val, File}).
+    do_insert(MsgId, Val, File, State).
 
 %% Updates are executed by a message store process, just like inserts.
 
@@ -133,6 +134,7 @@ delete_object(Obj, #index_state{ server = Server }) ->
 -spec clean_up_temporary_reference_count_entries_without_file(index_state()) -> 'ok'.
 clean_up_temporary_reference_count_entries_without_file(#index_state{ server = Server }) ->
     {ok, RecoveryIndex, Dir} = gen_server:call(Server, clean_up_temporary_reference_count_entries_without_file),
+    %% Destroy the recovery DB in a one-off process
     Pid = self(),
     spawn_link(fun() -> clear_recovery_index(RecoveryIndex, Dir), unlink(Pid) end),
     ok.
@@ -146,27 +148,24 @@ terminate(#index_state{ server = Server }) ->
 %% Gen-server API
 
 %% Non-clean shutdown. We create recovery index
-init([BaseDir, ReadOptions, new]) ->
+init([BaseDir, new]) ->
     % TODO: recover after crash
     Dir = index_dir(BaseDir),
     rabbit_file:recursive_delete([Dir]),
     {ok, RecoveryIndex} = init_recovery_index(BaseDir),
     {ok, DbRef} = eleveldb:open(Dir, open_options()),
     rabbit_log:error("INIT INDEX ~p~n", [self()]),
-    {ok, internal_state(DbRef, Dir, ReadOptions, RecoveryIndex)};
+    {ok, internal_state(DbRef, Dir, RecoveryIndex)};
 
 %% Clean shutdown. We don't need recovery index
-init([BaseDir, ReadOptions, recover]) ->
+init([BaseDir, recover]) ->
     Dir = index_dir(BaseDir),
     case eleveldb:open(Dir, open_options()) of
-        {ok, DbRef}  -> {ok, internal_state(DbRef, Dir, ReadOptions, undefined)};
-        {error, Err} -> {stop, Err}
+        {ok, DbRef}  -> {ok, internal_state(DbRef, Dir, undefined)};
+        {error, Err} ->
+            rabbit_log:error("Error trying to recover after graceful shutdown ~p~n", [Err]),
+            {stop, Err}
     end.
-
-handle_call({insert, MsgId, Val, File}, _From, State) ->
-    %% TODO in case of insert, we will fail to update an entry
-    not_found = lookup(MsgId, State),
-    {reply, do_insert(MsgId, Val, File, State), State};
 
 handle_call({update, MsgId, Val, File}, _From, State) ->
     {reply, do_insert(MsgId, Val, File, State), State};
@@ -203,7 +202,8 @@ handle_call(clean_up_temporary_reference_count_entries_without_file, _From,
     eleveldb:fold_keys(
         RecoveryIndex,
         fun(MsgId, nothing) ->
-            ok = eleveldb:delete(DB, MsgId, WriteOptions)
+            ok = eleveldb:delete(DB, MsgId, WriteOptions),
+            nothing
         end,
         nothing,
         ReadOptions),
@@ -212,6 +212,9 @@ handle_call(clean_up_temporary_reference_count_entries_without_file, _From,
 handle_call(reference, _From, #internal_state{ db = DB } = State) ->
     {reply, {ok, DB}, State}.
 
+handle_cast({maybe_update_recovery_index, MsgId, File}, State) ->
+    maybe_update_recovery_index(MsgId, File, State),
+    {noreply, State};
 handle_cast(_, State) ->
     {noreply, State}.
 
@@ -222,15 +225,21 @@ handle_info(_, State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-terminate(_, State) ->
+terminate(_Reason, State) ->
     do_terminate(State).
 
 %% ------------------------------------
 
 do_insert(MsgId, Val, File,
-          #internal_state{db = DB,
-                          write_options = WriteOptions} = State) ->
-    % rabbit_log:error("Write index ~p~n", [{MsgId, DB}]),
+          State = #index_state{ db = DB, write_options = WriteOptions }) ->
+% TODO: index state write options
+    do_insert(MsgId, Val, File, State, DB, WriteOptions);
+
+do_insert(MsgId, Val, File,
+          State = #internal_state{db = DB, write_options = WriteOptions}) ->
+    do_insert(MsgId, Val, File, State, DB, WriteOptions).
+
+do_insert(MsgId, Val, File, State, DB, WriteOptions) ->
     maybe_update_recovery_index(MsgId, File, State),
     ok = eleveldb:put(DB, MsgId, Val, WriteOptions).
 
@@ -247,17 +256,17 @@ do_delete(MsgId, #internal_state{ db = DB, write_options = WriteOptions} = State
     maybe_delete_recovery_index(MsgId, State),
     ok = eleveldb:delete(DB, MsgId, WriteOptions).
 
-internal_state(DbRef, Dir, ReadOptions, RecoveryIndex) ->
+internal_state(DbRef, Dir, RecoveryIndex) ->
     #internal_state{
         db = DbRef,
         dir = Dir,
-        read_options = ReadOptions,
-        write_options = ?WRITE_OPTIONS,
+        read_options = read_options(),
+        write_options = write_options(),
         recovery_index = RecoveryIndex }.
 
 do_terminate(#internal_state { db = DB,
                                recovery_index = RecoveryIndex,
-                               dir = Dir } = State) ->
+                               dir = Dir }) ->
     clear_recovery_index(RecoveryIndex, Dir),
     case eleveldb:close(DB) of
         ok           -> ok;
@@ -268,6 +277,8 @@ do_terminate(#internal_state { db = DB,
             error(Err)
     end.
 
+maybe_update_recovery_index(MsgId, File, #index_state{server = Server}) ->
+    gen_server:cast(Server, {maybe_update_recovery_index, MsgId, File});
 maybe_update_recovery_index(_MsgId, _File,
                             #internal_state{recovery_index = undefined}) ->
     ok;
@@ -304,9 +315,12 @@ init_recovery_index(BaseDir) ->
     rabbit_file:recursive_delete([RecoverNoFileDir]),
     eleveldb:open(RecoverNoFileDir, open_options()).
 
-index_state(Pid, ReadOptions) ->
+index_state(Pid) ->
     {ok, DB} = gen_server:call(Pid, reference),
-    #index_state{db = DB, server = Pid, read_options = ReadOptions}.
+    #index_state{db = DB,
+                 server = Pid,
+                 read_options = read_options(),
+                 write_options = write_options()}.
 
 decode_val(Val) ->
     binary_to_term(Val).
@@ -325,7 +339,15 @@ update_elements(Old, Updates) when is_list(Updates) ->
 
 open_options() ->
     lists:ukeymerge(1,
-                    application:get_env(rabbitmq_msg_store_index_eleveldb,
-                                        open_options,
-                                        []),
-                    ?OPEN_OPTIONS).
+        lists:usort(application:get_env(rabbitmq_msg_store_index_eleveldb, open_options, [])),
+        lists:usort(?OPEN_OPTIONS)).
+
+write_options() ->
+    lists:ukeymerge(1,
+        lists:usort(application:get_env(rabbitmq_msg_store_index_eleveldb, write_options, [])),
+        lists:usort(?WRITE_OPTIONS)).
+
+read_options() ->
+    lists:ukeymerge(1,
+        lists:usort(application:get_env(rabbitmq_msg_store_index_eleveldb, read_options, [])),
+        lists:usort(?READ_OPTIONS)).
