@@ -45,7 +45,8 @@
     db,
     server,
     read_options,
-    bloom_filter
+    bloom_filter,
+    write_options
 }).
 
 -define(OPEN_OPTIONS,
@@ -65,13 +66,13 @@
 
 -spec new(file:filename()) -> index_state().
 new(BaseDir) ->
-    {ok, Pid} = gen_server:start_link(?MODULE, [BaseDir, ?READ_OPTIONS, new], []),
-    index_state(Pid, ?READ_OPTIONS).
+    {ok, Pid} = gen_server:start_link(?MODULE, [BaseDir, new], []),
+    index_state(Pid).
 
 -spec recover(file:filename()) -> {ok, index_state()} | {error, term()}.
 recover(BaseDir) ->
-    case gen_server:start_link(?MODULE, [BaseDir, ?READ_OPTIONS, recover], []) of
-        {ok, Pid}    -> {ok, index_state(Pid, ?READ_OPTIONS)};
+    case gen_server:start_link(?MODULE, [BaseDir, recover], []) of
+        {ok, Pid}    -> {ok, index_state(Pid)};
         {error, Err} -> {error, Err}
     end.
 
@@ -149,7 +150,7 @@ terminate(#index_state{ server = Server }) ->
 %% Gen-server API
 
 %% Non-clean shutdown. We create recovery index
-init([BaseDir, ReadOptions, new]) ->
+init([BaseDir, new]) ->
     % TODO: recover after crash
     Dir = index_dir(BaseDir),
     rabbit_file:recursive_delete([Dir]),
@@ -161,13 +162,13 @@ init([BaseDir, ReadOptions, new]) ->
      #internal_state{
         db = DbRef,
         dir = Dir,
-        read_options = ReadOptions,
-        write_options = ?WRITE_OPTIONS,
+        read_options = read_options(),
+        write_options = write_options(),
         recovery_index = RecoveryIndex,
         bloom_filter = Bloom }};
 
 %% Clean shutdown. We don't need recovery index
-init([BaseDir, ReadOptions, recover]) ->
+init([BaseDir, recover]) ->
     Dir = index_dir(BaseDir),
     case {eleveldb:open(Dir, open_options()), load_bloom_filter()} of
         {{ok, DbRef}, {ok, Bloom}}  ->
@@ -175,8 +176,8 @@ init([BaseDir, ReadOptions, recover]) ->
              #internal_state{
                 db = DbRef,
                 dir = Dir,
-                read_options = ReadOptions,
-                write_options = ?WRITE_OPTIONS,
+                read_options = read_options(),
+                write_options = write_options(),
                 bloom_filter = Bloom }};
         {{error, Err}, _} ->
             rabbit_log:error("Error trying to recover a LevelDB after graceful shutdown ~p~n", [Err]),
@@ -252,9 +253,10 @@ terminate(_Reason, State) ->
 %% ------------------------------------
 
 do_insert(MsgId, Val, File,
-          State = #index_state{ db = DB, bloom_filter = Bloom }) ->
-% TODO: index state write options
-    do_insert(MsgId, Val, File, State, DB, [], Bloom);
+          State = #index_state{ db = DB,
+                                write_options = WriteOptions,
+                                bloom_filter = Bloom }) ->
+    do_insert(MsgId, Val, File, State, DB, WriteOptions, Bloom);
 
 do_insert(MsgId, Val, File,
           State = #internal_state{db = DB,
@@ -338,10 +340,14 @@ init_recovery_index(BaseDir) ->
     rabbit_file:recursive_delete([RecoverNoFileDir]),
     eleveldb:open(RecoverNoFileDir, open_options()).
 
-index_state(Pid, ReadOptions) ->
+index_state(Pid) ->
     {ok, DB} = gen_server:call(Pid, reference),
     {ok, Bloom} = gen_server:call(Pid, bloom_filter),
-    #index_state{db = DB, server = Pid, read_options = ReadOptions, bloom_filter = Bloom}.
+    #index_state{ db = DB,
+                  server = Pid,
+                  read_options = read_options(),
+                  write_options = write_options(),
+                  bloom_filter = Bloom}.
 
 init_bloom_filter() ->
     PredCount = 1000000,
@@ -367,8 +373,16 @@ update_elements(Old, Updates) when is_list(Updates) ->
                 Updates).
 
 open_options() ->
-    Opts = lists:ukeymerge(1,
+    lists:ukeymerge(1,
         lists:usort(application:get_env(rabbitmq_msg_store_index_eleveldb, open_options, [])),
-        lists:usort(?OPEN_OPTIONS)),
-    rabbit_log:error("Using open options ~p~n", [Opts]),
-    Opts.
+        lists:usort(?OPEN_OPTIONS)).
+
+write_options() ->
+    lists:ukeymerge(1,
+        lists:usort(application:get_env(rabbitmq_msg_store_index_eleveldb, write_options, [])),
+        lists:usort(?WRITE_OPTIONS)).
+
+read_options() ->
+    lists:ukeymerge(1,
+        lists:usort(application:get_env(rabbitmq_msg_store_index_eleveldb, read_options, [])),
+        lists:usort(?READ_OPTIONS)).
