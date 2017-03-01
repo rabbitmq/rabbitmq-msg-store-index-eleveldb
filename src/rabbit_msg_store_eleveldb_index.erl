@@ -35,7 +35,9 @@
 -define(BLOOM_FILTER_PREDICTED_COUNT, 1000000).
 %% Pack size is set to 0.1 predicted count.
 %% It's complitely arbitrry.
--define(BLOOM_FILTER_PACK_SIZE, 100000).
+% -define(BLOOM_FILTER_PACK_SIZE, 100000).
+
+-compile(export_all).
 
 -record(internal_state, {
     db,
@@ -215,6 +217,8 @@ handle_call({delete_object, MsgId, Val}, _From,
     end,
     {reply, ok, State};
 
+
+
 % This function is called only with `undefined` file name
 % TODO: refactor index recovery to avoid additional table
 % TODO: refactor index to modify the state.
@@ -252,7 +256,7 @@ handle_info(_, State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-terminate(_Reason, State) ->
+terminate(normal, State) ->
     do_terminate(State).
 
 %% ------------------------------------
@@ -403,8 +407,8 @@ init_bloom_filter() ->
     FPProbability = 0.01,
     RandomSeed = rand:uniform(10000),
     {ok, Bloom} = ebloom:new(PredCount, FPProbability, RandomSeed),
-    {ok, BloomThumbstone} = ebloom:new(PredCount, FPProbability, RandomSeed),
-    {Bloom, BloomThumbstone}.
+    % {ok, BloomThumbstone} = ebloom:new(PredCount, FPProbability, RandomSeed),
+    {Bloom, none}.
 
 load_bloom_filter(Dir) ->
     %% TODO: maybe recreate a filter using eleveldb:foldl
@@ -412,41 +416,43 @@ load_bloom_filter(Dir) ->
     case file:read_file(BloomFileName) of
         {ok, Binary} ->
             {ok, BloomFilter} = ebloom:deserialize(Binary),
-            PredCount = ebloom:predicted_elements(BloomFilter),
-            FPProbability = ebloom:desired_fpp(BloomFilter),
-            RandomSeed = ebloom:random_seed(BloomFilter),
-            {ok, BloomThumbstone} = ebloom:new(PredCount, FPProbability, RandomSeed),
-            {BloomFilter, BloomThumbstone};
+            % PredCount = ebloom:predicted_elements(BloomFilter),
+            % FPProbability = ebloom:desired_fpp(BloomFilter),
+            % RandomSeed = ebloom:random_seed(BloomFilter),
+            % {ok, BloomThumbstone} = ebloom:new(PredCount, FPProbability, RandomSeed),
+            {BloomFilter, none};
         {error, Err} ->
             {error, Err}
     end.
 
 save_bloom_filter({BloomFilter, _} = Bloom, Dir) ->
-    ok = pack_bloom_filter(Bloom),
+    % ok = pack_bloom_filter(Bloom),
     BloomFileName = filename:join(Dir, ?BLOOM_FILTER_FILE),
     Serialized = ebloom:serialize(BloomFilter),
     ok = ebloom:clear(BloomFilter),
     file:write_file(BloomFileName, Serialized).
 
 
-add_to_bloom_filter(MsgId, {BloomFilter, _BloomThumbstone}) ->
+add_to_bloom_filter(MsgId, {BloomFilter, _}) ->
     ok = ebloom:insert(BloomFilter, MsgId).
 
-check_bloom_filter(MsgId, {BloomFilter, _BloomThumbstone}) ->
+check_bloom_filter(MsgId, {BloomFilter, _}) ->
     ebloom:contains(BloomFilter, MsgId).
 
-record_bloom_filter_thumbstone(MsgId, {_, BloomThumbstone} = Bloom) ->
-    ok = ebloom:insert(BloomThumbstone, MsgId),
-    ok = maybe_pack_bloom_filter(Bloom).
+record_bloom_filter_thumbstone(_MsgId, {_, _BloomThumbstone} = _Bloom) -> ok.
+    % ok = ebloom:insert(BloomThumbstone, MsgId),
+    % ok = maybe_pack_bloom_filter(Bloom).
 
 %% We pack a bloom filter when a thumbstone filter reaches BLOOM_FILTER_PACK_SIZE
 %% There can be more optimal strategy though
-maybe_pack_bloom_filter({_, BloomThumbstone} = Bloom) ->
-    case ebloom:elements(BloomThumbstone) > ?BLOOM_FILTER_PACK_SIZE of
-        true  -> pack_bloom_filter(Bloom);
-        false -> ok
-    end.
+maybe_pack_bloom_filter({_, _BloomThumbstone} = _Bloom) -> ok.
+    % case ebloom:elements(BloomThumbstone) > ?BLOOM_FILTER_PACK_SIZE of
+        % true  -> pack_bloom_filter(Bloom);
+        % false -> ok
+    % end.
 
-pack_bloom_filter({BloomFilter, BloomThumbstone}) ->
-    ok = ebloom:difference(BloomFilter, BloomThumbstone),
-    ok = ebloom:clear(BloomThumbstone).
+pack_bloom_filter({_BloomFilter, _BloomThumbstone}) -> ok.
+    % rabbit_log:error("Packing a bloom filter of size ~p with thumbsones of size ~p~n",
+                     % [ebloom:elements(BloomFilter), ebloom:elements(BloomThumbstone)]),
+    % ok = ebloom:difference(BloomFilter, BloomThumbstone),
+    % ok = ebloom:clear(BloomThumbstone).
