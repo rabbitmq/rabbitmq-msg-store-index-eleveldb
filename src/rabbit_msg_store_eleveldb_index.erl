@@ -45,7 +45,8 @@
     read_options,
     write_options,
     recovery_index,
-    bloom_filter
+    bloom_filter,
+    rolling_index
 }).
 
 -record(index_state, {
@@ -53,14 +54,15 @@
     server,
     read_options,
     bloom_filter,
-    write_options
+    write_options,
+    rolling_index
 }).
 
 -define(OPEN_OPTIONS,
   [{create_if_missing, true},
    {write_buffer_size, 5242880},
    {compression,  false},
-   {use_bloomfilter, true},
+   {use_bloomfilter, false},
    {paranoid_checks, false},
    {verify_compactions, false}]).
 
@@ -84,10 +86,10 @@ recover(BaseDir) ->
     end.
 
 -spec lookup(rabbit_types:msg_id(), index_state()) -> ('not_found' | tuple()).
-lookup(MsgId, #internal_state{db = DB, read_options = ReadOptions, bloom_filter = Bloom}) ->
-    do_lookup(MsgId, DB, ReadOptions, Bloom);
-lookup(MsgId, #index_state{db = DB, read_options = ReadOptions, bloom_filter = Bloom}) ->
-    do_lookup(MsgId, DB, ReadOptions, Bloom).
+lookup(MsgId, #internal_state{db = DB, read_options = ReadOptions, bloom_filter = Bloom, rolling_index = Rolling}) ->
+    do_lookup(MsgId, DB, ReadOptions, Bloom, Rolling);
+lookup(MsgId, #index_state{db = DB, read_options = ReadOptions, bloom_filter = Bloom, rolling_index = Rolling}) ->
+    do_lookup(MsgId, DB, ReadOptions, Bloom, Rolling).
 
 %% Inserts are executed by a message store process only.
 %% GC cannot call insert,
@@ -95,7 +97,7 @@ lookup(MsgId, #index_state{db = DB, read_options = ReadOptions, bloom_filter = B
 
 % fail if object exists
 -spec insert(tuple(), index_state()) -> 'ok'.
-insert(Obj, State) ->
+insert(Obj, #index_state{rolling_index = Rolling} = State) ->
     MsgId = Obj#msg_location.msg_id,
     Val = encode_val(Obj),
 %% We need the file to update recovery index.
@@ -103,16 +105,18 @@ insert(Obj, State) ->
 %% should be deleted at the end of a recovery
 %% File can become defined, and should not be deleted.
     File = Obj#msg_location.file,
-    do_insert(MsgId, Val, File, State).
+    ok = do_insert(MsgId, Val, File, State),
+    ok = add_to_rolling_index(MsgId, Obj, Rolling).
 
 %% Updates are executed by a message store process, just like inserts.
 
 -spec update(tuple(), index_state()) -> 'ok'.
-update(Obj, #index_state{ server = Server }) ->
+update(Obj, #index_state{ server = Server, rolling_index = Rolling }) ->
     MsgId = Obj#msg_location.msg_id,
     Val = encode_val(Obj),
     File = Obj#msg_location.file,
-    gen_server:call(Server, {update, MsgId, Val, File}).
+    ok = gen_server:call(Server, {update, MsgId, Val, File}),
+    ok = add_to_rolling_index(MsgId, Obj, Rolling).
 
 %% update_fields can be executed by message store or GC
 
@@ -126,17 +130,20 @@ update_fields(MsgId, Updates, #index_state{ server = Server }) ->
 %% Deletes are performed by message store only, GC is using delete_object
 
 -spec delete(rabbit_types:msg_id(), index_state()) -> 'ok'.
-delete(MsgId, #index_state{ server = Server }) ->
-    gen_server:call(Server, {delete, MsgId}).
+delete(MsgId, #index_state{ server = Server, rolling_index = Rolling }) ->
+% TODO: Do we ever call that?
+    ok = gen_server:call(Server, {delete, MsgId}),
+    ok = remove_from_rolling_index(MsgId, Rolling).
 
 %% Delete object is performed by GC
 
 % do not delete different object
 -spec delete_object(tuple(), index_state()) -> 'ok'.
-delete_object(Obj, #index_state{ server = Server }) ->
+delete_object(Obj, #index_state{ server = Server, rolling_index = Rolling }) ->
     MsgId = Obj#msg_location.msg_id,
     Val = encode_val(Obj),
-    gen_server:call(Server, {delete_object, MsgId, Val}).
+    ok = gen_server:call(Server, {delete_object, MsgId, Val}),
+    ok = remove_from_rolling_index(MsgId, Rolling).
 
 %% clean_up_temporary_reference_count_entries_without_file is called by message store after recovery from scratch
 
@@ -164,7 +171,8 @@ init([BaseDir, new]) ->
     {ok, RecoveryIndex} = init_recovery_index(BaseDir),
     {ok, DbRef} = eleveldb:open(Dir, open_options()),
     Bloom = init_bloom_filter(),
-    rabbit_log:error("INIT INDEX ~p~n", [self()]),
+    rabbit_log:info("INIT INDEX ~p~n", [self()]),
+    init_rolling_index(),
     {ok,
      #internal_state{
         db = DbRef,
@@ -172,20 +180,23 @@ init([BaseDir, new]) ->
         read_options = read_options(),
         write_options = write_options(),
         recovery_index = RecoveryIndex,
-        bloom_filter = Bloom }};
+        bloom_filter = Bloom,
+        rolling_index = init_rolling_index() }};
 
 %% Clean shutdown. We don't need recovery index
 init([BaseDir, recover]) ->
     Dir = index_dir(BaseDir),
     case {eleveldb:open(Dir, open_options()), load_bloom_filter(Dir)} of
         {{ok, DbRef}, {ok, Bloom}}  ->
+            rabbit_log:info("RECOVER INDEX ~p~n", [self()]),
             {ok,
              #internal_state{
                 db = DbRef,
                 dir = Dir,
                 read_options = read_options(),
                 write_options = write_options(),
-                bloom_filter = Bloom }};
+                bloom_filter = Bloom,
+                rolling_index = init_rolling_index() }};
         {{error, Err}, _} ->
             rabbit_log:error("Error trying to recover a LevelDB after graceful shutdown ~p~n", [Err]),
             {stop, Err};
@@ -197,11 +208,14 @@ init([BaseDir, recover]) ->
 handle_call({update, MsgId, Val, File}, _From, State) ->
     {reply, do_insert(MsgId, Val, File, State), State};
 
-handle_call({update_fields, MsgId, Updates}, _From, State) ->
+handle_call({update_fields, MsgId, Updates}, _From,
+            #internal_state{rolling_index = Rolling} = State) ->
     #msg_location{} = Old = lookup(MsgId, State),
     New = update_elements(Old, Updates),
     File = New#msg_location.file,
-    {reply, do_insert(MsgId, encode_val(New), File, State), State};
+    ok = do_insert(MsgId, encode_val(New), File, State),
+    ok = add_to_rolling_index(MsgId, New, Rolling),
+    {reply, ok, State};
 
 handle_call({delete, MsgId}, _From, State) ->
     do_delete(MsgId, State),
@@ -213,11 +227,10 @@ handle_call({delete_object, MsgId, Val}, _From,
     case eleveldb:get(DB, MsgId, ReadOptions) of
         {ok, Val} ->
             do_delete(MsgId, State);
-        _ -> ok
+        _ ->
+            ok
     end,
     {reply, ok, State};
-
-
 
 % This function is called only with `undefined` file name
 % TODO: refactor index recovery to avoid additional table
@@ -227,21 +240,21 @@ handle_call(clean_up_temporary_reference_count_entries_without_file, _From,
                             dir  = Dir,
                             recovery_index = RecoveryIndex,
                             read_options = ReadOptions,
-                            write_options = WriteOptions} = State) ->
+                            write_options = WriteOptions,
+                            rolling_index = Rolling} = State) ->
     eleveldb:fold_keys(
         RecoveryIndex,
         fun(MsgId, nothing) ->
             ok = eleveldb:delete(DB, MsgId, WriteOptions),
+            ok = remove_from_rolling_index(MsgId, Rolling),
             nothing
         end,
         nothing,
         ReadOptions),
     {reply, {ok, RecoveryIndex, Dir}, State#internal_state{ recovery_index = undefined }};
 
-handle_call(reference, _From, #internal_state{ db = DB } = State) ->
-    {reply, {ok, DB}, State};
-handle_call(bloom_filter, _From, #internal_state{ bloom_filter = Bloom } = State) ->
-    {reply, {ok, Bloom}, State}.
+handle_call(state, _From, State) ->
+    {reply, {ok, State}, State}.
 
 handle_cast({maybe_update_recovery_index, MsgId, File}, State) ->
     maybe_update_recovery_index(MsgId, File, State),
@@ -278,27 +291,33 @@ do_insert(MsgId, Val, File, State, DB, WriteOptions, Bloom) ->
     ok = eleveldb:put(DB, MsgId, Val, WriteOptions),
     ok = add_to_bloom_filter(MsgId, Bloom).
 
-do_lookup(MsgId, DB, ReadOptions, Bloom) ->
-    % rabbit_log:error("Read index ~p~n", [{MsgId, DB}]),
-    case check_bloom_filter(MsgId, Bloom) of
-        true ->
-            case eleveldb:get(DB, MsgId, ReadOptions) of
-                not_found    ->
-                    rabbit_log:error("False positive!!!!"),
-                    not_found;
-                {ok, Val}    -> decode_val(Val);
-                {error, Err} -> {error, Err}
+do_lookup(MsgId, DB, ReadOptions, Bloom, Rolling) ->
+    case read_from_rolling_index(MsgId, Rolling) of
+        not_found ->
+            case check_bloom_filter(MsgId, Bloom) of
+                true ->
+                    case eleveldb:get(DB, MsgId, ReadOptions) of
+                        not_found    ->
+                            rabbit_log:error("False positive!!!! ~p~n", [MsgId]),
+                            not_found;
+                        {ok, Val}    ->
+                            % rabbit_log:error("Read from LEVELDB!!!! ~p~n Rolling ETS size ~p~n", [MsgId, ets:info(Rolling, size)]),
+                            decode_val(Val);
+                        {error, Err} -> {error, Err}
+                    end;
+                false -> not_found
             end;
-        false -> not_found
+        {ok, Msg} -> Msg
     end.
 
 do_delete(MsgId, #internal_state{ db = DB,
                                   write_options = WriteOptions,
-                                  bloom_filter = Bloom} = State) ->
-    % rabbit_log:error("Delete index ~p~n", [{MsgId, DB}]),
+                                  bloom_filter = _Bloom} = State) ->
     maybe_delete_recovery_index(MsgId, State),
-    ok = eleveldb:delete(DB, MsgId, WriteOptions),
-    ok = record_bloom_filter_thumbstone(MsgId, Bloom).
+    ok = eleveldb:delete(DB, MsgId, WriteOptions)
+    % ,
+    % ok = record_bloom_filter_thumbstone(MsgId, Bloom)
+    .
 
 do_terminate(#internal_state { db = DB,
                                recovery_index = RecoveryIndex,
@@ -359,13 +378,16 @@ init_recovery_index(BaseDir) ->
     eleveldb:open(RecoverNoFileDir, open_options()).
 
 index_state(Pid) ->
-    {ok, DB} = gen_server:call(Pid, reference),
-    {ok, Bloom} = gen_server:call(Pid, bloom_filter),
+    {ok, #internal_state{
+        db = DB,
+        bloom_filter = Bloom,
+        rolling_index = Rolling }} = gen_server:call(Pid, state),
     #index_state{ db = DB,
                   server = Pid,
                   read_options = read_options(),
                   write_options = write_options(),
-                  bloom_filter = Bloom}.
+                  bloom_filter = Bloom,
+                  rolling_index = Rolling}.
 
 decode_val(Val) ->
     binary_to_term(Val).
@@ -425,7 +447,7 @@ load_bloom_filter(Dir) ->
             {error, Err}
     end.
 
-save_bloom_filter({BloomFilter, _} = Bloom, Dir) ->
+save_bloom_filter({BloomFilter, _} = _Bloom, Dir) ->
     % ok = pack_bloom_filter(Bloom),
     BloomFileName = filename:join(Dir, ?BLOOM_FILTER_FILE),
     Serialized = ebloom:serialize(BloomFilter),
@@ -433,19 +455,24 @@ save_bloom_filter({BloomFilter, _} = Bloom, Dir) ->
     file:write_file(BloomFileName, Serialized).
 
 
-add_to_bloom_filter(MsgId, {BloomFilter, _}) ->
-    ok = ebloom:insert(BloomFilter, MsgId).
+add_to_bloom_filter(MsgId, {BloomFilter, _} = _Bloom) ->
+    % case check_bloom_filter(MsgId, Bloom) of
+        % true  -> ok;
+        % false ->
+            % inc_insert(),
+            ok = ebloom:insert(BloomFilter, MsgId).
+    % end.
 
 check_bloom_filter(MsgId, {BloomFilter, _}) ->
     ebloom:contains(BloomFilter, MsgId).
 
-record_bloom_filter_thumbstone(_MsgId, {_, _BloomThumbstone} = _Bloom) -> ok.
+% record_bloom_filter_thumbstone(_MsgId, {_, _BloomThumbstone} = _Bloom) -> ok.
     % ok = ebloom:insert(BloomThumbstone, MsgId),
     % ok = maybe_pack_bloom_filter(Bloom).
 
 %% We pack a bloom filter when a thumbstone filter reaches BLOOM_FILTER_PACK_SIZE
 %% There can be more optimal strategy though
-maybe_pack_bloom_filter({_, _BloomThumbstone} = _Bloom) -> ok.
+% maybe_pack_bloom_filter({_, _BloomThumbstone} = _Bloom) -> ok.
     % case ebloom:elements(BloomThumbstone) > ?BLOOM_FILTER_PACK_SIZE of
         % true  -> pack_bloom_filter(Bloom);
         % false -> ok
@@ -456,3 +483,40 @@ pack_bloom_filter({_BloomFilter, _BloomThumbstone}) -> ok.
                      % [ebloom:elements(BloomFilter), ebloom:elements(BloomThumbstone)]),
     % ok = ebloom:difference(BloomFilter, BloomThumbstone),
     % ok = ebloom:clear(BloomThumbstone).
+
+
+%% ------------------------------------
+%% Rolling index functions
+%% ------------------------------------
+
+-define(ROLLING_INDEX_SIZE, 1000000).
+-define(ROLLING_INDEX_NAME, rabbit_msg_store_eleveldb_index_rolling).
+
+init_rolling_index() ->
+    ets:new(?ROLLING_INDEX_NAME, [set, public]).
+
+add_to_rolling_index(MsgId, Msg, Rolling) ->
+    %TODO: maybe bulk clean?
+    case ets:info(Rolling, size) of
+        Val when Val >= ?ROLLING_INDEX_SIZE ->
+            ets:delete(Rolling, ets:first(Rolling));
+        _ -> ok
+    end,
+    true = ets:insert(Rolling, {MsgId, Msg}),
+    ok.
+
+remove_from_rolling_index(MsgId, Rolling) ->
+    true = ets:delete(Rolling, MsgId),
+    ok.
+
+read_from_rolling_index(MsgId, Rolling) ->
+    case ets:lookup(Rolling, MsgId) of
+        [{_, #msg_location{msg_id = MsgId} = Msg}] -> {ok, Msg};
+        [] -> not_found;
+        Other ->
+            rabbit_log:error("Expected ~p~n Got ~p~n", [MsgId, Other]),
+            not_found
+    end.
+
+
+
