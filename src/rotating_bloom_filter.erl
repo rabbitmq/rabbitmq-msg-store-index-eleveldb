@@ -18,12 +18,34 @@
 
 -export([wait_for_rotated/2]).
 
-%% eBloom filter consumes 1.14 MB per 1 million predicted count
+%% eBloom filter consumes ~ 1 MB per 1 million predicted count
 %% and 0.01 probability.
 %% Given the constant probability, it will grow linearly when increasing
 %% predicted count.
-%% This module uses two filter objects, so it will use 2.28 MB of memory with
+%% This module uses two filter objects, so it will use ~ 2 MB of memory with
 %% 1 million predicted count.
+
+%% The module implements rotating bloom filter.
+%% If entries can be added and deleted from a set, bloom filter can overflow
+%% and increase number of false-positives.
+%% To avoid that the filter can be recreated based on some rules.
+%% This implementation counts adds and removes to detect if the filter should
+%% be rotated.
+%% GC_ADDS_FRACTION and GC_REMOVES_FRACTION are fractions of predicted count,
+%% add and remove counters should reach to start rotation.
+%% Rotation is performed on remove.
+
+%% Rotation requires a fold function, which will fold over a set of values.
+%% Since the fold function can take some time, rotation is done in a separate
+%% process.
+%% There are two filters, one is considered `active`. When rotation starts,
+%% it will clean `unactive` filter, and fill it with values using fold function.
+%% When fold is done, `unactive` filter becomes `active` and `active` filter is
+%% cleared.
+%% Inserts are made to both filters, so fold running in parallel won't lose any
+%% new entries.
+%% Lookups can be made from an active filter.
+
 
 init(PredCount) ->
     FPProbability = ?FPP_PROBABILITY,
@@ -79,8 +101,6 @@ save(#bloom_filter_state{counters = Counters} = Bloom, Dir) ->
 add(MsgId, #bloom_filter_state{ filter_one = FOne,
                                                 filter_two = FTwo,
                                                 counters = Counters }) ->
-    %% Adding to both filters is faster than reading
-    %% the ETS table and selecting one
     ok = ebloom:insert(FOne, MsgId),
     ok = ebloom:insert(FTwo, MsgId),
     ets:update_counter(Counters,
@@ -88,13 +108,12 @@ add(MsgId, #bloom_filter_state{ filter_one = FOne,
                        {#bloom_filter_counter.adds, 1}),
     ok.
 
-contains(MsgId, #bloom_filter_state{ filter_one = FOne,
-                                               filter_two = FTwo}) ->
-    %% We check both filters.
-    %% At least one should contain an entity,
-    %% to guarantee no false-negatives
-    ebloom:contains(FOne, MsgId) orelse
-    ebloom:contains(FTwo, MsgId).
+contains(MsgId, #bloom_filter_state{ counters   = Counters } = Bloom) ->
+    [#bloom_filter_active{active = Active}] =
+        ets:lookup(Counters, bloom_filter_active),
+    ActiveFilter = element(Active, Bloom),
+
+    ebloom:contains(ActiveFilter, MsgId).
 
 record_removal(#bloom_filter_state{counters = Counters} = Bloom, FoldFun) ->
     ets:update_counter(Counters,
@@ -209,8 +228,12 @@ rotate(#bloom_filter_state{counters = Counters} = Bloom, FoldFun) ->
             ok),
     %% When we finish with adding elements to a new filter,
     %% we should rotate it and clean the old active filter.
-    ok = set_clean_state(Counters, Rotating),
-    ok = ebloom:clear(ActiveFilter).
+    %% First we set a new active filter
+    ok = rotate_active(Counters, Rotating),
+    %% Then we clean up the old filter
+    ok = ebloom:clear(ActiveFilter),
+    %% Finally we set rotating state to clean
+    ok = set_clean_state(Counters).
 
 wait_for_rotated(#bloom_filter_state{counters = Counters} = Bloom, Interval) ->
     timer:sleep(Interval),
@@ -232,11 +255,16 @@ set_rotating_state(Counters, Adds, Removes) ->
                               {#bloom_filter_active.state, rotating}),
     ok.
 
-
-set_clean_state(Counters, Filter) ->
-    %% Set state to 'clean' and 'active' to a new filter position
+%% When we set the new active filter, we are still in rotating state.
+rotate_active(Counters, Filter) ->
     true = ets:insert(Counters,
-                      #bloom_filter_active{ state = clean, active = Filter}),
+                      #bloom_filter_active{ state = rotating, active = Filter}),
+    ok.
+
+set_clean_state(Counters) ->
+    true = ets:update_element(Counters,
+                              bloom_filter_active,
+                              {#bloom_filter_active.state, clean}),
     ok.
 
 record_false_positive(#bloom_filter_state{counters = Counters}) ->
