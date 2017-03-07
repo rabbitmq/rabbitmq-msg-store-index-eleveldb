@@ -21,8 +21,11 @@
 -behaviour(rabbit_msg_store_index).
 
 -export([new/1, recover/1,
-         lookup/2, insert/2, update/2, update_fields/3, delete/2,
-         delete_object/2, clean_up_temporary_reference_count_entries_without_file/1, terminate/1]).
+         lookup/2, insert/2,
+         update/2, update_fields/3,
+         delete/2, delete_object/2,
+         clean_up_temporary_reference_count_entries_without_file/1,
+         terminate/1]).
 
 -behaviour(gen_server).
 
@@ -92,11 +95,13 @@ lookup(MsgId, #index_state{db = DB, read_options = ReadOptions, bloom_filter = B
 -spec insert(tuple(), index_state()) -> 'ok'.
 insert(Obj, State) ->
     MsgId = Obj#msg_location.msg_id,
+    %% Fail if the same key entry exists
+    not_found = lookup(MsgId, State),
     Val = encode_val(Obj),
-%% We need the file to update recovery index.
-%% File can be undefined, in that case it
-%% should be deleted at the end of a recovery
-%% File can become defined, and should not be deleted.
+    %% We need the file to update recovery index.
+    %% File can be undefined, in that case it
+    %% should be deleted at the end of a recovery
+    %% File can become defined, and should not be deleted.
     File = Obj#msg_location.file,
     ok = do_insert(MsgId, Val, File, State),
     ok = rotating_bloom_filter:add(MsgId, State#index_state.bloom_filter).
@@ -104,11 +109,12 @@ insert(Obj, State) ->
 %% Updates are executed by a message store process, just like inserts.
 
 -spec update(tuple(), index_state()) -> 'ok'.
-update(Obj, #index_state{ server = Server }) ->
+update(Obj, #index_state{ server = Server, bloom_filter = Bloom }) ->
     MsgId = Obj#msg_location.msg_id,
     Val = encode_val(Obj),
     File = Obj#msg_location.file,
-    gen_server:call(Server, {update, MsgId, Val, File}).
+    ok = gen_server:call(Server, {update, MsgId, Val, File}),
+    ok = rotating_bloom_filter:add(MsgId, Bloom).
 
 %% update_fields can be executed by message store or GC
 
@@ -257,7 +263,16 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 terminate(normal, State) ->
-    do_terminate(State).
+    do_terminate(State);
+terminate(Error, #internal_state{ db = DB, recovery_index = Recover }) ->
+    rabbit_log:error("Message store ElevelDB index terminated with error ~p~n",
+                     [Error]),
+    ok = eleveldb:close(DB),
+    case Recover of
+        undefined -> ok;
+        _         -> ok = eleveldb:close(Recover)
+    end,
+    ok.
 
 %% ------------------------------------
 
@@ -358,7 +373,7 @@ recover_index_dir(BaseDir) ->
 
 init_recovery_index(BaseDir) ->
     RecoverNoFileDir = recover_index_dir(BaseDir),
-    rabbit_file:recursive_delete([RecoverNoFileDir]),
+    ok = rabbit_file:recursive_delete([RecoverNoFileDir]),
     eleveldb:open(RecoverNoFileDir, open_options()).
 
 index_state(Pid) ->

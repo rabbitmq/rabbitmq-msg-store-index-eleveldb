@@ -16,6 +16,7 @@
 -export([add/2, contains/2, record_removal/2]).
 -export([record_false_positive/1]).
 
+-export([wait_for_rotated/2]).
 
 %% eBloom filter consumes 1.14 MB per 1 million predicted count
 %% and 0.01 probability.
@@ -58,7 +59,7 @@ save(#bloom_filter_state{counters = Counters} = Bloom, Dir) ->
     %% Save the current filter only.
     ActiveFilterIndex = case ets:lookup(Counters, bloom_filter_active) of
         [#bloom_filter_active{state = rotating}] ->
-            wait_for_rotated(Counters, ?WAIT_INTERVAL),
+            wait_for_rotated(Bloom, ?WAIT_INTERVAL),
             %% After rotating it will be clean.
             [#bloom_filter_active{state = clean, active = Filter}] =
                 ets:lookup(Counters, bloom_filter_active),
@@ -211,12 +212,12 @@ rotate(#bloom_filter_state{counters = Counters} = Bloom, FoldFun) ->
     ok = set_clean_state(Counters, Rotating),
     ok = ebloom:clear(ActiveFilter).
 
-wait_for_rotated(Counters, Interval) ->
+wait_for_rotated(#bloom_filter_state{counters = Counters} = Bloom, Interval) ->
     timer:sleep(Interval),
     case ets:lookup(Counters, bloom_filter_active) of
         [#bloom_filter_active{state = rotating}] ->
-            wait_for_rotated(Counters, Interval);
-        [#bloom_filter_active{state = clear}] ->
+            wait_for_rotated(Bloom, Interval);
+        [#bloom_filter_active{state = clean}] ->
             ok
     end.
 
