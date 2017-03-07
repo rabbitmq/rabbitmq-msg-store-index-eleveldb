@@ -37,7 +37,7 @@ init(PredCount) ->
 
 load(Dir) ->
     FileName = filename:join(Dir, ?FILTER_FILE),
-    case {file:read_file(FileName), load_counters(Dir)} of
+    case {load_bloom_filter(FileName), load_counters(Dir)} of
         {{ok, Binary}, {ok, {Adds, Removes}}} ->
             {ok, Filter} = ebloom:deserialize(Binary),
             PredCount = ebloom:predicted_elements(Filter),
@@ -114,6 +114,16 @@ init_metadata_ets(Adds, Removes) ->
                           state = clean }),
     true = ets:insert(Counters, {false_positives, 0}),
     Counters.
+
+load_bloom_filter(FileName) ->
+    case file:read_file(FileName) of
+        {ok, Binary} ->
+            case file:delete(FileName) of
+                ok -> {ok, Binary};
+                {error, Err} -> {error, Err}
+            end;
+        {error, Err} -> {error, Err}
+    end.
 
 load_counters(Dir) ->
     Path = filename:join(Dir, ?METADATA_FILE),
