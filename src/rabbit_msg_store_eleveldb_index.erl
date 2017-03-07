@@ -31,11 +31,6 @@
 
 -define(INDEX_DIR, "eleveldb").
 -define(TMP_RECOVER_INDEX, "recover_no_file").
--define(BLOOM_FILTER_FILE, "bloom_filter").
--define(BLOOM_FILTER_PREDICTED_COUNT, 1000000).
-%% Pack size is set to 0.1 predicted count.
-%% It's complitely arbitrry.
-% -define(BLOOM_FILTER_PACK_SIZE, 100000).
 
 -compile(export_all).
 
@@ -103,7 +98,8 @@ insert(Obj, State) ->
 %% should be deleted at the end of a recovery
 %% File can become defined, and should not be deleted.
     File = Obj#msg_location.file,
-    do_insert(MsgId, Val, File, State).
+    ok = do_insert(MsgId, Val, File, State),
+    ok = rotating_bloom_filter:add(MsgId, State#index_state.bloom_filter).
 
 %% Updates are executed by a message store process, just like inserts.
 
@@ -155,7 +151,7 @@ terminate(#index_state{ server = Server }) ->
 %% ------------------------------------
 
 %% Gen-server API
-
+-define(BLOOM_PREDICTED_COUNT, 1000000).
 %% Non-clean shutdown. We create recovery index
 init([BaseDir, new]) ->
     % TODO: recover after crash
@@ -163,8 +159,12 @@ init([BaseDir, new]) ->
     rabbit_file:recursive_delete([Dir]),
     {ok, RecoveryIndex} = init_recovery_index(BaseDir),
     {ok, DbRef} = eleveldb:open(Dir, open_options()),
-    Bloom = init_bloom_filter(),
-    rabbit_log:error("INIT INDEX ~p~n", [self()]),
+    BloomFilterPredictedCount =
+        application:get_env(rabbitmq_msg_store_index_eleveldb,
+                            bloom_filter_size,
+                            ?BLOOM_PREDICTED_COUNT),
+    Bloom = rotating_bloom_filter:init(BloomFilterPredictedCount),
+    rabbit_log:info("INIT INDEX ~p~n", [self()]),
     {ok,
      #internal_state{
         db = DbRef,
@@ -177,7 +177,7 @@ init([BaseDir, new]) ->
 %% Clean shutdown. We don't need recovery index
 init([BaseDir, recover]) ->
     Dir = index_dir(BaseDir),
-    case {eleveldb:open(Dir, open_options()), load_bloom_filter(Dir)} of
+    case {eleveldb:open(Dir, open_options()), rotating_bloom_filter:load(Dir)} of
         {{ok, DbRef}, {ok, Bloom}}  ->
             {ok,
              #internal_state{
@@ -263,28 +263,25 @@ terminate(normal, State) ->
 
 do_insert(MsgId, Val, File,
           State = #index_state{ db = DB,
-                                write_options = WriteOptions,
-                                bloom_filter = Bloom }) ->
-    do_insert(MsgId, Val, File, State, DB, WriteOptions, Bloom);
+                                write_options = WriteOptions}) ->
+    do_insert(MsgId, Val, File, State, DB, WriteOptions);
 
 do_insert(MsgId, Val, File,
           State = #internal_state{db = DB,
-                                  write_options = WriteOptions,
-                                  bloom_filter = Bloom}) ->
-    do_insert(MsgId, Val, File, State, DB, WriteOptions, Bloom).
+                                  write_options = WriteOptions}) ->
+    do_insert(MsgId, Val, File, State, DB, WriteOptions).
 
-do_insert(MsgId, Val, File, State, DB, WriteOptions, Bloom) ->
+do_insert(MsgId, Val, File, State, DB, WriteOptions) ->
     maybe_update_recovery_index(MsgId, File, State),
-    ok = eleveldb:put(DB, MsgId, Val, WriteOptions),
-    ok = add_to_bloom_filter(MsgId, Bloom).
+    ok = eleveldb:put(DB, MsgId, Val, WriteOptions).
 
 do_lookup(MsgId, DB, ReadOptions, Bloom) ->
     % rabbit_log:error("Read index ~p~n", [{MsgId, DB}]),
-    case check_bloom_filter(MsgId, Bloom) of
+    case rotating_bloom_filter:contains(MsgId, Bloom) of
         true ->
             case eleveldb:get(DB, MsgId, ReadOptions) of
                 not_found    ->
-                    rabbit_log:error("False positive!!!!"),
+                    rotating_bloom_filter:record_false_positive(Bloom),
                     not_found;
                 {ok, Val}    -> decode_val(Val);
                 {error, Err} -> {error, Err}
@@ -298,14 +295,20 @@ do_delete(MsgId, #internal_state{ db = DB,
     % rabbit_log:error("Delete index ~p~n", [{MsgId, DB}]),
     maybe_delete_recovery_index(MsgId, State),
     ok = eleveldb:delete(DB, MsgId, WriteOptions),
-    ok = record_bloom_filter_thumbstone(MsgId, Bloom).
+    FoldFun = fun(Fun, Acc) ->
+        eleveldb:fold_keys(DB,
+            Fun,
+            Acc,
+            ?READ_OPTIONS)
+    end,
+    ok = rotating_bloom_filter:record_removal(Bloom, FoldFun).
 
 do_terminate(#internal_state { db = DB,
                                recovery_index = RecoveryIndex,
                                dir = Dir,
                                bloom_filter = Bloom }) ->
     clear_recovery_index(RecoveryIndex, Dir),
-    case {eleveldb:close(DB), save_bloom_filter(Bloom, Dir)} of
+    case {eleveldb:close(DB), rotating_bloom_filter:save(Bloom, Dir)} of
         {ok, ok}                 -> ok;
         {{error, Err}, BloomRes} ->
             rabbit_log:error("Unable to stop message store index"
@@ -398,61 +401,5 @@ read_options() ->
         lists:usort(?READ_OPTIONS)).
 
 
-%% ------------------------------------
-%% Bloom filter functions
-%% ------------------------------------
-
-init_bloom_filter() ->
-    PredCount = ?BLOOM_FILTER_PREDICTED_COUNT,
-    FPProbability = 0.01,
-    RandomSeed = rand:uniform(10000),
-    {ok, Bloom} = ebloom:new(PredCount, FPProbability, RandomSeed),
-    % {ok, BloomThumbstone} = ebloom:new(PredCount, FPProbability, RandomSeed),
-    {Bloom, none}.
-
-load_bloom_filter(Dir) ->
-    %% TODO: maybe recreate a filter using eleveldb:foldl
-    BloomFileName = filename:join(Dir, ?BLOOM_FILTER_FILE),
-    case file:read_file(BloomFileName) of
-        {ok, Binary} ->
-            {ok, BloomFilter} = ebloom:deserialize(Binary),
-            % PredCount = ebloom:predicted_elements(BloomFilter),
-            % FPProbability = ebloom:desired_fpp(BloomFilter),
-            % RandomSeed = ebloom:random_seed(BloomFilter),
-            % {ok, BloomThumbstone} = ebloom:new(PredCount, FPProbability, RandomSeed),
-            {BloomFilter, none};
-        {error, Err} ->
-            {error, Err}
-    end.
-
-save_bloom_filter({BloomFilter, _} = Bloom, Dir) ->
-    % ok = pack_bloom_filter(Bloom),
-    BloomFileName = filename:join(Dir, ?BLOOM_FILTER_FILE),
-    Serialized = ebloom:serialize(BloomFilter),
-    ok = ebloom:clear(BloomFilter),
-    file:write_file(BloomFileName, Serialized).
 
 
-add_to_bloom_filter(MsgId, {BloomFilter, _}) ->
-    ok = ebloom:insert(BloomFilter, MsgId).
-
-check_bloom_filter(MsgId, {BloomFilter, _}) ->
-    ebloom:contains(BloomFilter, MsgId).
-
-record_bloom_filter_thumbstone(_MsgId, {_, _BloomThumbstone} = _Bloom) -> ok.
-    % ok = ebloom:insert(BloomThumbstone, MsgId),
-    % ok = maybe_pack_bloom_filter(Bloom).
-
-%% We pack a bloom filter when a thumbstone filter reaches BLOOM_FILTER_PACK_SIZE
-%% There can be more optimal strategy though
-maybe_pack_bloom_filter({_, _BloomThumbstone} = _Bloom) -> ok.
-    % case ebloom:elements(BloomThumbstone) > ?BLOOM_FILTER_PACK_SIZE of
-        % true  -> pack_bloom_filter(Bloom);
-        % false -> ok
-    % end.
-
-pack_bloom_filter({_BloomFilter, _BloomThumbstone}) -> ok.
-    % rabbit_log:error("Packing a bloom filter of size ~p with thumbsones of size ~p~n",
-                     % [ebloom:elements(BloomFilter), ebloom:elements(BloomThumbstone)]),
-    % ok = ebloom:difference(BloomFilter, BloomThumbstone),
-    % ok = ebloom:clear(BloomThumbstone).
