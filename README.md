@@ -33,8 +33,8 @@ Bloom filter will consume 2.28 MB per million messages and it's size should be
 configured using `bloom_filter_size` application environment variable.
 The default value for this variable is 1 million.
 
-If there are more messages in a message store, false positives rate will increase
-and throughput will suffer.
+**If there are more messages in a message store, false positives rate will increase
+and throughput will suffer.**
 
 The bloom filter is being rotated when messages are deleted. If number of messages
 added since the last rotation is more than 0.6 of size, and number of messages
@@ -61,7 +61,27 @@ bloom filter size to 10 million messages (will consume ~ 23MB),
 so the total index memory consumption will be ~ 123MB:
 
 ```
-[{rabbit,   [{msg_store_index_module, rabbit_msg_store_eleveldb_index}]},
+[{rabbit, [{msg_store_index_module, rabbit_msg_store_eleveldb_index}]},
  {rabbitmq_msg_store_index_eleveldb, [{bloom_filter_size, 10000000}]},
  {eleveldb, [{total_leveldb_mem, 104857600}]}].
+```
+
+
+LevelDB supports several [configuration options](https://github.com/google/leveldb/blob/master/include/leveldb/options.h),
+which can be configured for the index:
+
+```
+[{rabbit, [{msg_store_index_module, rabbit_msg_store_eleveldb_index}]},
+ {rabbitmq_msg_store_index_eleveldb, [
+    % Set the write buffer size to 50MB to have less disk flushes and bigger
+    % initial file size.
+    {open_options, [{write_buffer_size, 52428800}]},
+    % Will verify all read data. Can use more CPU and make reads slower.
+    % False by default.
+    {read_options, [{verify_checksums, true}]},
+    % Will sync all writes to disk.
+    % Disabled by default, because index is being recalculated if message store
+    % wasn't stopped gracefully.
+    {write_options, [{sync, true}]}
+    ]}].
 ```
