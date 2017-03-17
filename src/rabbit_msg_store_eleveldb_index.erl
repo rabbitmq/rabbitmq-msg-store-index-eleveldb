@@ -22,7 +22,7 @@
 
 -export([new/1, recover/1,
          lookup/2, insert/2,
-         update/2, update_fields/3,
+         update_ref_count/3, update_file_location/5,
          delete/2, delete_object/2,
          clean_up_temporary_reference_count_entries_without_file/1,
          terminate/1]).
@@ -45,8 +45,9 @@
 %% suffer.
 
 %% Directories inside message store directory, to store leveldb data.
--define(INDEX_DIR, "eleveldb").
--define(TMP_RECOVER_INDEX, "recover_no_file").
+-define(REF_COUNT_DIR, "rc_eleveldb").
+-define(FILE_LOCATION_DIR, "fl_eleveldb").
+-define(TMP_RECOVER_INDEX, "recover_no_file_eleveldb").
 
 %% The module uses `open_options`, `read_options` and `write_options`
 %% app environment variables, merging them with this default values.
@@ -68,8 +69,11 @@
 
 %% Internal state for gen_server process
 -record(internal_state, {
-    db,
-    dir,
+    ref_count_db,
+    file_location_db,
+    base_dir,
+    ref_count_dir,
+    file_location_dir,
     read_options,
     write_options,
     recovery_index,
@@ -78,7 +82,8 @@
 
 %% Index state to be returned to message store
 -record(index_state, {
-    db,
+    ref_count_db,
+    file_location_db,
     server,
     read_options,
     write_options,
@@ -104,16 +109,17 @@ recover(BaseDir) ->
     end.
 
 -spec lookup(rabbit_types:msg_id(), index_state()) -> ('not_found' | tuple()).
-lookup(MsgId, #internal_state{db = DB, read_options = ReadOptions, bloom_filter = Bloom}) ->
-    do_lookup(MsgId, DB, ReadOptions, Bloom);
-lookup(MsgId, #index_state{db = DB, read_options = ReadOptions, bloom_filter = Bloom}) ->
-    do_lookup(MsgId, DB, ReadOptions, Bloom).
+lookup(MsgId, #internal_state{ref_count_db = RCDB, file_location_db = FLDB,
+                              read_options = ReadOptions, bloom_filter = Bloom}) ->
+    do_lookup(MsgId, RCDB, FLDB, ReadOptions, Bloom);
+lookup(MsgId, #index_state{ref_count_db = RCDB, file_location_db = FLDB,
+                           read_options = ReadOptions, bloom_filter = Bloom}) ->
+    do_lookup(MsgId, RCDB, FLDB, ReadOptions, Bloom).
 
 %% This function can fail if the object exists
 -spec insert(tuple(), index_state()) -> 'ok'.
 insert(Obj, State) ->
     MsgId = Obj#msg_location.msg_id,
-    Val = encode_val(Obj),
     %% We need the file to update recovery index.
     %% File can be undefined, in that case it
     %% should be deleted at the end of a recovery
@@ -121,23 +127,19 @@ insert(Obj, State) ->
     File = Obj#msg_location.file,
     %% Fail if the same key entry exists
     not_found = lookup(MsgId, State),
-    ok = do_insert(MsgId, Val, File, State),
+    ok = do_insert(MsgId, Obj, File, State),
     ok = rotating_bloom_filter:add(MsgId, State#index_state.bloom_filter).
 
--spec update(tuple(), index_state()) -> 'ok'.
-update(Obj, #index_state{ server = Server, bloom_filter = Bloom }) ->
-    MsgId = Obj#msg_location.msg_id,
-    Val = encode_val(Obj),
-    File = Obj#msg_location.file,
-    ok = gen_server:call(Server, {update, MsgId, Val, File}),
-    ok = rotating_bloom_filter:add(MsgId, Bloom).
+-spec update_ref_count(rabbit_types:msg_id(), integer(), index_state()) -> 'ok'.
+update_ref_count(MsgId, RefCount, #index_state{ server = Server }) ->
+    Val = encode_val(RefCount),
+    ok = gen_server:call(Server, {update_ref_count, MsgId, Val}).
 
-%% This function can fail if the object doesn't exist
--spec update_fields(rabbit_types:msg_id(), ({integer(), any()} |
-                                            [{integer(), any()}]),
-                        index_state()) -> 'ok'.
-update_fields(MsgId, Updates, #index_state{ server = Server }) ->
-    gen_server:call(Server, {update_fields, MsgId, Updates}).
+-spec update_file_location(rabbit_types:msg_id(), string(), integer(),
+                           integer(), index_state()) -> 'ok'.
+update_file_location(MsgId, File, Offset, TotalSize, #index_state{ server = Server }) ->
+    Val = encode_val({File, Offset, TotalSize}),
+    ok = gen_server:call(Server, {update_file_location, MsgId, Val, File}).
 
 -spec delete(rabbit_types:msg_id(), index_state()) -> 'ok'.
 delete(MsgId, #index_state{ server = Server }) ->
@@ -146,17 +148,16 @@ delete(MsgId, #index_state{ server = Server }) ->
 -spec delete_object(tuple(), index_state()) -> 'ok'.
 delete_object(Obj, #index_state{ server = Server }) ->
     MsgId = Obj#msg_location.msg_id,
-    Val = encode_val(Obj),
-    gen_server:call(Server, {delete_object, MsgId, Val}).
+    gen_server:call(Server, {delete_object, MsgId, Obj}).
 
 %% Clean up is using temporary recovery_index to store entries with `undefined`
 %% file field. After recovery, the entries left in this index are deleted.
 -spec clean_up_temporary_reference_count_entries_without_file(index_state()) -> 'ok'.
 clean_up_temporary_reference_count_entries_without_file(#index_state{ server = Server }) ->
-    {ok, RecoveryIndex, Dir} = gen_server:call(Server, clean_up_temporary_reference_count_entries_without_file),
+    {ok, RecoveryIndex, BaseDir} = gen_server:call(Server, clean_up_temporary_reference_count_entries_without_file),
     %% Destroy the recovery DB in a one-off process
     Pid = self(),
-    spawn_link(fun() -> clear_recovery_index(RecoveryIndex, Dir), unlink(Pid) end),
+    spawn_link(fun() -> clear_recovery_index(RecoveryIndex, BaseDir), unlink(Pid) end),
     ok.
 
 -spec terminate(index_state()) -> any().
@@ -169,10 +170,13 @@ terminate(#index_state{ server = Server }) ->
 
 %% Non-clean shutdown. We create recovery index
 init([BaseDir, new]) ->
-    Dir = index_dir(BaseDir),
-    rabbit_file:recursive_delete([Dir]),
+    RCDir = ref_count_dir(BaseDir),
+    FLDir = file_location_dir(BaseDir),
+    rabbit_file:recursive_delete([RCDir]),
+    rabbit_file:recursive_delete([FLDir]),
     {ok, RecoveryIndex} = init_recovery_index(BaseDir),
-    {ok, DbRef} = eleveldb:open(Dir, open_options()),
+    {ok, RCDB} = eleveldb:open(RCDir, open_options()),
+    {ok, FLDB} = eleveldb:open(FLDir, open_options()),
     BloomFilterPredictedCount =
         application:get_env(rabbitmq_msg_store_index_eleveldb,
                             bloom_filter_size,
@@ -181,8 +185,11 @@ init([BaseDir, new]) ->
     rabbit_log:info("INIT INDEX ~p~n", [self()]),
     {ok,
      #internal_state{
-        db = DbRef,
-        dir = Dir,
+        ref_count_db = RCDB,
+        file_location_db = FLDB,
+        ref_count_dir = RCDir,
+        file_location_dir = FLDir,
+        base_dir = BaseDir,
         read_options = read_options(),
         write_options = write_options(),
         recovery_index = RecoveryIndex,
@@ -190,65 +197,78 @@ init([BaseDir, new]) ->
 
 %% Clean shutdown. We don't need recovery index
 init([BaseDir, recover]) ->
-    Dir = index_dir(BaseDir),
-    case {eleveldb:open(Dir, open_options()), rotating_bloom_filter:load(Dir)} of
-        {{ok, DbRef}, {ok, Bloom}}  ->
+    RCDir = ref_count_dir(BaseDir),
+    FLDir = file_location_dir(BaseDir),
+    case {eleveldb:open(RCDir, open_options()),
+          eleveldb:open(FLDir, open_options()),
+          rotating_bloom_filter:load(BaseDir)} of
+        {{ok, RCDB}, {ok, FLDB}, {ok, Bloom}}  ->
             {ok,
              #internal_state{
-                db = DbRef,
-                dir = Dir,
+                ref_count_db = RCDB,
+                file_location_db = FLDB,
+                ref_count_dir = RCDir,
+                file_location_dir = FLDir,
+                base_dir = BaseDir,
                 read_options = read_options(),
                 write_options = write_options(),
                 bloom_filter = Bloom }};
-        {{error, Err}, _} ->
+        {{error, Err}, _, _} ->
             rabbit_log:error("Error trying to recover a LevelDB after graceful shutdown ~p~n", [Err]),
             {stop, Err};
-        {_, {error, Err}} ->
+        {_, {error, Err}, _} ->
+            rabbit_log:error("Error trying to recover a LevelDB after graceful shutdown ~p~n", [Err]),
+            {stop, Err};
+        {_, _, {error, Err}} ->
             rabbit_log:error("Error trying to recover a bloom filter after graceful shutdown ~p~n", [Err]),
             {stop, Err}
     end.
 
-handle_call({update, MsgId, Val, File}, _From, State) ->
-    {reply, do_insert(MsgId, Val, File, State), State};
+handle_call({update_ref_count, MsgId, Val}, _From, State) ->
+    {reply, do_update_ref_count(MsgId, Val, State), State};
 
-handle_call({update_fields, MsgId, Updates}, _From, State) ->
-    #msg_location{} = Old = lookup(MsgId, State),
-    New = update_elements(Old, Updates),
-    File = New#msg_location.file,
-    {reply, do_insert(MsgId, encode_val(New), File, State), State};
+handle_call({update_file_location, MsgId, Val, File}, _From, State) ->
+    {reply, do_update_file_location(MsgId, Val, File, State), State};
 
 handle_call({delete, MsgId}, _From, State) ->
     do_delete(MsgId, State),
     {reply, ok, State};
 
-handle_call({delete_object, MsgId, Val}, _From,
-            #internal_state{db = DB,
+handle_call({delete_object, MsgId, Obj}, _From,
+            #internal_state{ref_count_db = RCDB,
+                            file_location_db = FLDB,
                             read_options = ReadOptions} = State) ->
-    case eleveldb:get(DB, MsgId, ReadOptions) of
-        {ok, Val} ->
-            do_delete(MsgId, State);
-        _ -> ok
+    RefCount = ref_count(Obj),
+    FileLocation = file_location(Obj),
+    RefCVal = encode_val(RefCount),
+    FileLVal = encode_val(FileLocation),
+    case {eleveldb:get(RCDB, MsgId, ReadOptions), eleveldb:get(FLDB, MsgId, ReadOptions)} of
+        {{ok, RefCVal}, {ok, FileLVal}} -> do_delete(MsgId, State);
+        {not_found, not_found}          -> ok
     end,
     {reply, ok, State};
 
 handle_call(clean_up_temporary_reference_count_entries_without_file, _From,
-            #internal_state{db = DB,
-                            dir  = Dir,
+            #internal_state{ref_count_db = RCDB,
+                            file_location_db = FLDB,
+                            base_dir = BaseDir,
                             recovery_index = RecoveryIndex,
                             read_options = ReadOptions,
                             write_options = WriteOptions} = State) ->
     eleveldb:fold_keys(
         RecoveryIndex,
         fun(MsgId, nothing) ->
-            ok = eleveldb:delete(DB, MsgId, WriteOptions),
+            ok = eleveldb:delete(RCDB, MsgId, WriteOptions),
+            ok = eleveldb:delete(FLDB, MsgId, WriteOptions),
             nothing
         end,
         nothing,
         ReadOptions),
-    {reply, {ok, RecoveryIndex, Dir}, State#internal_state{ recovery_index = undefined }};
+    {reply, {ok, RecoveryIndex, BaseDir}, State#internal_state{ recovery_index = undefined }};
 
-handle_call(reference, _From, #internal_state{ db = DB } = State) ->
-    {reply, {ok, DB}, State};
+handle_call(reference, _From, #internal_state{ ref_count_db = RCDB,
+                                               file_location_db = FLDB } = State) ->
+    {reply, {ok, RCDB, FLDB}, State};
 handle_call(bloom_filter, _From, #internal_state{ bloom_filter = Bloom } = State) ->
     {reply, {ok, Bloom}, State}.
 
@@ -269,10 +289,13 @@ terminate(normal, State) ->
     do_terminate(State);
 %% Close DB references without saving index to disk.
 %% If references are not saved - ElevelDB will fail to open DB directory.
-terminate(Error, #internal_state{ db = DB, recovery_index = Recover }) ->
+terminate(Error, #internal_state{ ref_count_db = RCDB,
+                                  file_location_db = FLDB,
+                                  recovery_index = Recover }) ->
     rabbit_log:error("Message store ElevelDB index terminated with error ~p~n",
                      [Error]),
-    ok = eleveldb:close(DB),
+    ok = eleveldb:close(RCDB),
+    ok = eleveldb:close(FLDB),
     case Recover of
         undefined -> ok;
         _         -> ok = eleveldb:close(Recover)
@@ -283,70 +306,91 @@ terminate(Error, #internal_state{ db = DB, recovery_index = Recover }) ->
 %% Internal functions
 %% ------------------------------------
 
-do_insert(MsgId, Val, File,
-          State = #index_state{ db = DB,
+do_insert(MsgId, Obj, File,
+          State = #index_state{ ref_count_db = RCDB,
+                                file_location_db = FLDB,
                                 write_options = WriteOptions}) ->
-    do_insert(MsgId, Val, File, State, DB, WriteOptions);
-
-do_insert(MsgId, Val, File,
-          State = #internal_state{db = DB,
-                                  write_options = WriteOptions}) ->
-    do_insert(MsgId, Val, File, State, DB, WriteOptions).
-
-do_insert(MsgId, Val, File, State, DB, WriteOptions) ->
+    RefCount = ref_count(Obj),
+    FileLocation = file_location(Obj),
+    RefCVal = encode_val(RefCount),
+    FileLVal = encode_val(FileLocation),
     maybe_update_recovery_index(MsgId, File, State),
-    ok = eleveldb:put(DB, MsgId, Val, WriteOptions).
+    ok = eleveldb:put(RCDB, MsgId, RefCVal, WriteOptions),
+    ok = eleveldb:put(FLDB, MsgId, FileLVal, WriteOptions).
 
-do_lookup(MsgId, DB, ReadOptions, Bloom) ->
+do_lookup(MsgId, RCDB, FLDB, ReadOptions, Bloom) ->
     case rotating_bloom_filter:contains(MsgId, Bloom) of
         true ->
-            case eleveldb:get(DB, MsgId, ReadOptions) of
+            case eleveldb:get(RCDB, MsgId, ReadOptions) of
                 not_found    ->
                     rotating_bloom_filter:record_false_positive(Bloom),
                     not_found;
-                {ok, Val}    -> decode_val(Val);
+                {ok, RCVal}    ->
+                    RC = decode_val(RCVal),
+                    {ok, FLVal} = eleveldb:get(FLDB, MsgId, ReadOptions),
+                    FL = decode_val(FLVal),
+                    make_obj(MsgId, RC, FL);
                 {error, Err} -> {error, Err}
             end;
         false -> not_found
     end.
 
-do_delete(MsgId, #internal_state{ db = DB,
+do_update_ref_count(MsgId, Val, #internal_state{ ref_count_db = DB, write_options = WriteOptions }) ->
+    ok = eleveldb:put(DB, MsgId, Val, WriteOptions).
+
+do_update_file_location(MsgId, Val, File, State = #internal_state{ file_location_db = DB, write_options = WriteOptions }) ->
+    maybe_update_recovery_index(MsgId, File, State),
+    ok = eleveldb:put(DB, MsgId, Val, WriteOptions).
+
+do_delete(MsgId, #internal_state{ ref_count_db = RCDB,
+                                  file_location_db = FLDB,
                                   write_options = WriteOptions,
                                   bloom_filter = Bloom} = State) ->
     maybe_delete_recovery_index(MsgId, State),
-    ok = eleveldb:delete(DB, MsgId, WriteOptions),
+    ok = eleveldb:delete(RCDB, MsgId, WriteOptions),
+    ok = eleveldb:delete(FLDB, MsgId, WriteOptions),
     FoldFun = fun(Fun, Acc) ->
-        eleveldb:fold_keys(DB,
+        eleveldb:fold_keys(RCDB,
             Fun,
             Acc,
             ?READ_OPTIONS)
     end,
     ok = rotating_bloom_filter:record_removal(Bloom, FoldFun).
 
-do_terminate(#internal_state { db = DB,
+do_terminate(#internal_state { ref_count_db = RCDB,
+                               file_location_db = FLDB,
                                recovery_index = RecoveryIndex,
-                               dir = Dir,
+                               base_dir = BaseDir,
+                               ref_count_dir = RCDir,
+                               file_location_dir = FLDir,
                                bloom_filter = Bloom }) ->
-    clear_recovery_index(RecoveryIndex, Dir),
-    case {eleveldb:close(DB), rotating_bloom_filter:save(Bloom, Dir)} of
-        {ok, ok}                 -> ok;
-        {{error, Err}, BloomRes} ->
+    clear_recovery_index(RecoveryIndex, BaseDir),
+    case {eleveldb:close(RCDB), eleveldb:close(FLDB), rotating_bloom_filter:save(Bloom, BaseDir)} of
+        {ok, ok, ok}                 -> ok;
+        {{error, Err}, _, BloomRes} ->
             rabbit_log:error("Unable to stop message store index"
                              " for directory ~p.~nError: ~p~n"
                              "Bloom filter save: ~p~n",
-                             [filename:dirname(Dir), Err, BloomRes]),
+                             [filename:dirname(RCDir), Err, BloomRes]),
             error(Err);
-        {ok, {error, Err}} ->
+        {_, {error, Err}, BloomRes} ->
+            rabbit_log:error("Unable to stop message store index"
+                             " for directory ~p.~nError: ~p~n"
+                             "Bloom filter save: ~p~n",
+                             [filename:dirname(FLDir), Err, BloomRes]),
+            error(Err);
+        {_, _, {error, Err}} ->
             rabbit_log:error("Unable to save a bloom filter for message store index"
                              " for directory ~p.~nError: ~p~n",
-                             [filename:dirname(Dir), Err]),
+                             [filename:dirname(BaseDir), Err]),
             error(Err)
     end.
 
 index_state(Pid) ->
-    {ok, DB} = gen_server:call(Pid, reference),
+    {ok, RCDB, FLDB} = gen_server:call(Pid, references),
     {ok, Bloom} = gen_server:call(Pid, bloom_filter),
-    #index_state{ db = DB,
+    #index_state{ ref_count_db = RCDB,
+                  file_location_db = FLDB,
                   server = Pid,
                   read_options = read_options(),
                   write_options = write_options(),
@@ -380,17 +424,20 @@ maybe_delete_recovery_index(MsgId,
     ok = eleveldb:delete(RecoveryIndex, MsgId, []).
 
 clear_recovery_index(undefined, _) -> ok;
-clear_recovery_index(RecoveryIndex, Dir) ->
+clear_recovery_index(RecoveryIndex, BaseDir) ->
     ok = eleveldb:close(RecoveryIndex),
-    ok = eleveldb:destroy(recover_index_dir(filename:dirname(Dir)),
+    ok = eleveldb:destroy(recover_index_dir(BaseDir),
                           open_options()).
 
 %% ------------------------------------
 %% Configuration functions
 %% ------------------------------------
 
-index_dir(BaseDir) ->
-    filename:join(BaseDir, ?INDEX_DIR).
+ref_count_dir(BaseDir) ->
+    filename:join(BaseDir, ?REF_COUNT_DIR).
+
+file_location_dir(BaseDir) ->
+    filename:join(BaseDir, ?FILE_LOCATION_DIR).
 
 recover_index_dir(BaseDir) ->
     filename:join(BaseDir, ?TMP_RECOVER_INDEX).
@@ -405,15 +452,6 @@ decode_val(Val) ->
 
 encode_val(Obj) ->
     term_to_binary(Obj).
-
-update_elements(Old, Update) when is_tuple(Update) ->
-    update_elements(Old, [Update]);
-update_elements(Old, Updates) when is_list(Updates) ->
-    lists:foldl(fun({Index, Val}, Rec) ->
-                    erlang:setelement(Index, Rec, Val)
-                end,
-                Old,
-                Updates).
 
 open_options() ->
     lists:ukeymerge(1,
@@ -432,4 +470,17 @@ read_options() ->
 
 
 
+make_obj(MsgId, RefCount, {File, Offset, TotalSize}) ->
+    #msg_location{msg_id = MsgId,
+                  ref_count = RefCount,
+                  file = File,
+                  offset = Offset,
+                  total_size = TotalSize}.
 
+
+ref_count(#msg_location{ ref_count = RC }) -> RC.
+
+file_location(#msg_location{file = File,
+                            offset = Offset,
+                            total_size = TotalSize}) ->
+    {File, Offset, TotalSize}.
