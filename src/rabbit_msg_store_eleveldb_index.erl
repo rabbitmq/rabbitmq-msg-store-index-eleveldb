@@ -266,8 +266,8 @@ handle_call(clean_up_temporary_reference_count_entries_without_file, _From,
         ReadOptions),
     {reply, {ok, RecoveryIndex, BaseDir}, State#internal_state{ recovery_index = undefined }};
 
-handle_call(reference, _From, #internal_state{ ref_count_db = RCDB,
-                                               file_location_db = FLDB } = State) ->
+handle_call(references, _From, #internal_state{ ref_count_db = RCDB,
+                                                file_location_db = FLDB } = State) ->
     {reply, {ok, RCDB, FLDB}, State};
 handle_call(bloom_filter, _From, #internal_state{ bloom_filter = Bloom } = State) ->
     {reply, {ok, Bloom}, State}.
