@@ -37,9 +37,9 @@ The default value for this variable is 1 million.
 and throughput will suffer.**
 
 The bloom filter is being rotated when messages are deleted. If number of messages
-added since the last rotation is more than 0.6 of size, and number of messages
-removed is more than 0.3 of size - it will be rotated to reflect the new set of
-messages.
+added since the last rotation is higher than 60% of prediceted size,
+and number of messages removed is higher than 30% of that size -
+the filter will be rotated to reflect the new set of messages.
 
 ### Configuration
 
