@@ -6,7 +6,7 @@ This plugin provides a message store index module for RabbitMQ, based on
 The goal of the plugin is to provide "infinite" (limited by disk size only)
 message store with constant memory usage.
 
-The plugin uses a rotating bloom filter to detact entries which weren't added,
+The plugin uses a rotating bloom filter to detect entries which weren't added,
 or were removed from the index. This reduce a throughput for messages that are
 consumed before being synced to disk.
 
@@ -24,12 +24,12 @@ and locating message position on disk. Each message location record takes approx
 So 1 million messages in ETS index, will require ~ 120MB of memory,
 10 million will require ~ 1GB.
 
-The memory consumed by ElebelDB index depends on several settings.
+The memory consumed by ElevelDB index depends on several settings.
 You can configure `total_leveldb_mem` application environment variable to set
 memory limit for LevelDB itself. Increasing the limit can increase the throughput
 for large message stores.
 
-Bloom filter will consume 2.28 MB per million messages and it's size should be
+Bloom filter will consume 2.28 MB per million messages and its size should be
 configured using `bloom_filter_size` application environment variable.
 The default value for this variable is 1 million.
 
