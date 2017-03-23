@@ -104,8 +104,6 @@ recover(BaseDir) ->
     end.
 
 -spec lookup(rabbit_types:msg_id(), index_state()) -> ('not_found' | tuple()).
-lookup(MsgId, #internal_state{db = DB, read_options = ReadOptions, bloom_filter = Bloom}) ->
-    do_lookup(MsgId, DB, ReadOptions, Bloom);
 lookup(MsgId, #index_state{db = DB, read_options = ReadOptions, bloom_filter = Bloom}) ->
     do_lookup(MsgId, DB, ReadOptions, Bloom).
 
@@ -178,7 +176,6 @@ init([BaseDir, new]) ->
                             bloom_filter_size,
                             ?BLOOM_FILTER_SIZE),
     Bloom = rotating_bloom_filter:init(BloomFilterPredictedCount),
-    rabbit_log:info("INIT INDEX ~p~n", [self()]),
     {ok,
      #internal_state{
         db = DbRef,
@@ -211,8 +208,11 @@ init([BaseDir, recover]) ->
 handle_call({update, MsgId, Val, File}, _From, State) ->
     {reply, do_insert(MsgId, Val, File, State), State};
 
-handle_call({update_fields, MsgId, Updates}, _From, State) ->
-    #msg_location{} = Old = lookup(MsgId, State),
+handle_call({update_fields, MsgId, Updates}, _From,
+            State= #internal_state{db = DB,
+                                   read_options = ReadOptions,
+                                   bloom_filter = Bloom}) ->
+    #msg_location{} = Old = do_lookup(MsgId, DB, ReadOptions, Bloom),
     New = update_elements(Old, Updates),
     File = New#msg_location.file,
     {reply, do_insert(MsgId, encode_val(New), File, State), State};
