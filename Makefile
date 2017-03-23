@@ -2,7 +2,7 @@ PROJECT = rabbitmq_msg_store_index_eleveldb
 PROJECT_DESCRIPTION = RabbitMQ message store index based on eleveldb
 
 DEPS = rabbit_common rabbit eleveldb ebloom
-TEST_DEPS = ct_helper rabbitmq_ct_helpers
+TEST_DEPS = rabbitmq_ct_helpers
 
 dep_ebloom = git https://github.com/basho/ebloom.git master
 
