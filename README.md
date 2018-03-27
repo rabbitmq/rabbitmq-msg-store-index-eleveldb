@@ -10,7 +10,7 @@ Default message store index implementation in RabbitMQ is RAM only.
 
 ## Supported RabbitMQ Versions
 
-This plugin targets RabbitMQ 3.7.0 (currently in development on RabbitMQ `master` branch).
+This plugin targets RabbitMQ 3.7.
 
 
 ## Installation
@@ -114,4 +114,4 @@ See the LICENSE file.
 
 ## Copyright
 
-(c) Pivotal Software Inc., 2007-2017.
+(c) Pivotal Software Inc., 2007-2018.
