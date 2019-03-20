@@ -16,7 +16,7 @@ This plugin targets RabbitMQ 3.7.
 ## Installation
 
 There are no binary builds of this plugin yet. Build it from source
-[like any other plugin](http://www.rabbitmq.com/plugin-development.html).
+[like any other plugin](https://www.rabbitmq.com/plugin-development.html).
 
 
 ## Configuration
